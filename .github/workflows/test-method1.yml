@@ -1,12 +1,19 @@
-name: Test Method 1 (WebTorrent Stream)
+name: Test Method 1 (Magnet Chunked Preview)
 
 on:
   workflow_dispatch:
     inputs:
-      torrent_source:
-        description: 'Magnet URI or .torrent URL'
+      magnet_link:
+        description: 'Direct Magnet URI'
         required: true
-        default: 'https://webtorrent.io/torrents/sintel.torrent'
+        default: 'magnet:?xt=urn:btih:08ada5a7a6183aae1e09d831df6748d566095a10&dn=Sintel&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce&tr=wss%3A%2F%2Ftracker.openwebtorrent.com&ws=https%3A%2F%2Fwebtorrent.io%2Ftorrents%2F'
+      seek_time:
+        description: 'Timestamp for thumbnail & clip (HH:MM:SS)'
+        required: false
+        default: '00:00:30'
+
+permissions:
+  contents: write
 
 jobs:
   test-method-1:
@@ -24,13 +31,14 @@ jobs:
           sudo apt-get update && sudo apt-get install -y ffmpeg
           npm install
 
-      - name: Run Method 1
-        run: node method1_stream.mjs "${{ inputs.torrent_source }}"
+      - name: Generate preview from magnet
+        run: node method1_stream.mjs "${{ inputs.magnet_link }}" "${{ inputs.seek_time }}"
 
-      - name: Upload Method 1 outputs
-        uses: actions/upload-artifact@v4
-        with:
-          name: method1-preview
-          path: |
-            m1_thumbnail.jpg
-            m1_preview.mp4
+      - name: Commit previews to repo folder
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add previews/
+          git diff --staged --quiet || git commit -m "Add generated thumbnail and preview"
+          git pull --rebase
+          git push
