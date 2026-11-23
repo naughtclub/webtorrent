@@ -17,7 +17,7 @@ const DEFAULT_TRACKERS = [
 ]
 
 const rawMagnetUri = process.argv[2]
-const pointsArg = process.argv[3] || '20,40,60,80'
+const pointsArg = process.argv[3] || '10,20,30,40,50,60,70,80'
 
 if (!rawMagnetUri || !rawMagnetUri.startsWith('magnet:')) {
   console.error('Usage: node method1_stream.mjs "<magnet_uri>" [percent_list]')
