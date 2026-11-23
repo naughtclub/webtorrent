@@ -1,29 +1,73 @@
 import WebTorrent from 'webtorrent'
 import http from 'node:http'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 
 const magnetUri = process.argv[2]
-const seekTime = process.argv[3] || '00:00:30'
+const pointsArg = process.argv[3] || '20,40,60,80'
 
 if (!magnetUri || !magnetUri.startsWith('magnet:')) {
-  console.error('Usage: node method1_stream.mjs "<magnet_uri>" [seek_time]')
+  console.error('Usage: node method1_stream.mjs "<magnet_uri>" [percent_list]')
   process.exit(1)
 }
 
-function runFfmpeg(args) {
+const samplePercents = pointsArg
+  .split(',')
+  .map((s) => parseFloat(s.trim()))
+  .filter((n) => Number.isFinite(n) && n > 0 && n < 100)
+  .map((n) => n / 100)
+
+if (samplePercents.length === 0) {
+  console.error('Provide valid percentages between 1 and 99 (e.g., 20,40,60,80)')
+  process.exit(1)
+}
+
+function runCmd(cmd, args) {
   return new Promise((resolve, reject) => {
-    const proc = spawn('ffmpeg', args, { stdio: 'inherit' })
+    const proc = spawn(cmd, args, { stdio: 'inherit' })
     proc.on('error', reject)
     proc.on('close', (code) => {
       if (code === 0) resolve()
-      else reject(new Error(`ffmpeg exited with code ${code}`))
+      else reject(new Error(`${cmd} exited with code ${code}`))
     })
   })
 }
 
-function startChunkedServer(file, chunkSize = 1024 * 1024) {
+function runCmdCapture(cmd, args) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    let stdout = ''
+    let stderr = ''
+    proc.stdout.on('data', (d) => (stdout += d.toString()))
+    proc.stderr.on('data', (d) => (stderr += d.toString()))
+    proc.on('error', reject)
+    proc.on('close', (code) => {
+      if (code === 0) resolve(stdout)
+      else reject(new Error(`${cmd} exited with code ${code}: ${stderr.trim()}`))
+    })
+  })
+}
+
+async function probeVideo(streamUrl) {
+  const out = await runCmdCapture('ffprobe', [
+    '-v', 'error',
+    '-select_streams', 'v:0',
+    '-show_entries', 'stream=width,height:format=duration',
+    '-of', 'json',
+    streamUrl,
+  ])
+  const data = JSON.parse(out)
+  const duration = parseFloat(data.format?.duration)
+  const stream = data.streams?.[0] || {}
+  if (!Number.isFinite(duration) || duration <= 0) {
+    throw new Error(`Could not determine video duration: ${out}`)
+  }
+  return { duration, width: stream.width, height: stream.height }
+}
+
+function startChunkedServer(file, chunkSize = 512 * 1024) {
   return new Promise((resolve) => {
     const server = http.createServer(async (req, res) => {
       if (req.url !== '/video') {
@@ -62,15 +106,15 @@ function startChunkedServer(file, chunkSize = 1024 * 1024) {
 
       let closed = false
       let activeStream = null
-      const onClose = () => {
-        closed = true
-        if (activeStream) activeStream.destroy()
-      }
-      req.on('close', onClose)
-      res.on('close', onClose)
+      res.on('close', () => {
+        if (!res.writableEnded) {
+          closed = true
+          if (activeStream) activeStream.destroy()
+        }
+      })
 
       try {
-        // Only request 1 MB at a time from WebTorrent so it never buffers the full file
+        // Pull only 512 KB at a time so WebTorrent never buffers the entire file
         for (let pos = start; pos <= end && !closed; pos += chunkSize) {
           const chunkEnd = Math.min(pos + chunkSize - 1, end)
           activeStream = file.createReadStream({ start: pos, end: chunkEnd })
@@ -118,7 +162,6 @@ client.add(
   magnetUri,
   { deselect: true, destroyStoreOnDestroy: true },
   async (torrent) => {
-    // Extra safeguard to ensure zero background pieces are queued
     torrent.deselect(0, torrent.pieces.length - 1, false)
     torrent.files.forEach((f) => f.deselect())
 
@@ -133,30 +176,72 @@ client.add(
       return
     }
 
-    const safeName = path
-      .parse(file.name)
-      .name.replace(/[^a-zA-Z0-9._-]+/g, '_')
-      .slice(0, 40)
-    const outDir = path.join('previews', `${safeName}-${torrent.infoHash.slice(0, 8)}`)
+    // Wipe output/ so old files are completely replaced
+    const outDir = path.resolve('output')
+    fs.rmSync(outDir, { recursive: true, force: true })
     fs.mkdirSync(outDir, { recursive: true })
 
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'preview-clips-'))
     const thumbPath = path.join(outDir, 'thumbnail.jpg')
     const previewPath = path.join(outDir, 'preview.mp4')
 
     const { server, url: streamUrl } = await startChunkedServer(file)
-    console.log(`Target: ${file.name} (${(file.length / 1e6).toFixed(2)} MB)`)
-    console.log(`Output: ${outDir}/`)
 
     try {
-      // Single FFmpeg pass outputs both thumbnail and 5-second preview clip
-      await runFfmpeg([
+      const { duration, width, height } = await probeVideo(streamUrl)
+      console.log(
+        `Target: ${file.name} (${(file.length / 1e6).toFixed(2)} MB | ${width}x${height} | ${duration.toFixed(1)}s)`
+      )
+
+      const clipPaths = []
+
+      for (let i = 0; i < samplePercents.length; i++) {
+        const pct = samplePercents[i]
+        const ts = Math.max(0, Math.min(duration - 1.1, duration * pct)).toFixed(2)
+        const clipPath = path.join(tmpDir, `clip_${i}.mp4`)
+        clipPaths.push(clipPath)
+
+        console.log(`Capturing 1s clip at ${Math.round(pct * 100)}% (${ts}s)...`)
+
+        const args = ['-y', '-ss', ts, '-i', streamUrl]
+
+        // Grab full-resolution thumbnail from the first sample point (20%) with zero extra download
+        if (i === 0) {
+          args.push('-frames:v', '1', '-q:v', '2', thumbPath)
+        }
+
+        // Grab 1-second full-resolution clip (pad ensures even dimensions for libx264 without scaling)
+        args.push(
+          '-t', '1',
+          '-an',
+          '-vf', 'pad=ceil(iw/2)*2:ceil(ih/2)*2',
+          '-c:v', 'libx264',
+          '-preset', 'veryfast',
+          '-crf', '23',
+          '-pix_fmt', 'yuv420p',
+          '-bf', '0',
+          '-video_track_timescale', '90000',
+          clipPath
+        )
+
+        await runCmd('ffmpeg', args)
+      }
+
+      // Merge all 1-second clips into a single full-resolution preview
+      const concatListPath = path.join(tmpDir, 'concat.txt')
+      const concatContent = clipPaths
+        .map((p) => `file '${p.replace(/'/g, "'\\''")}'`)
+        .join('\n')
+      fs.writeFileSync(concatListPath, concatContent)
+
+      console.log(`Merging ${clipPaths.length} clips into output/preview.mp4...`)
+      await runCmd('ffmpeg', [
         '-y',
-        '-ss', seekTime,
-        '-i', streamUrl,
-        '-frames:v', '1', '-vf', 'scale=640:-2', '-q:v', '2',
-        thumbPath,
-        '-t', '5', '-an', '-vf', 'scale=480:-2',
-        '-c:v', 'libx264', '-crf', '28', '-movflags', '+faststart',
+        '-f', 'concat',
+        '-safe', '0',
+        '-i', concatListPath,
+        '-c', 'copy',
+        '-movflags', '+faststart',
         previewPath,
       ])
 
@@ -165,14 +250,16 @@ client.add(
       const totalMB = (file.length / 1e6).toFixed(2)
       const pct = ((torrent.downloaded / file.length) * 100).toFixed(2)
 
-      console.log('\n--- METHOD 1 (CHUNKED) RESULTS ---')
+      console.log('\n--- METHOD 1 (MULTI-POINT FULL-RES) RESULTS ---')
+      console.log(`Resolution:   ${width}x${height} (native)`)
       console.log(`Elapsed time: ${elapsedSec}s`)
       console.log(`Downloaded:   ${downloadedMB} MB / ${totalMB} MB (${pct}%)`)
-      console.log(`Saved files:  ${thumbPath}, ${previewPath}`)
+      console.log(`Saved files:  output/thumbnail.jpg, output/preview.mp4`)
     } catch (err) {
-      console.error('FFmpeg failed:', err.message)
+      console.error('Failed:', err.message)
       process.exitCode = 1
     } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
       server.close()
       client.destroy(() => process.exit(process.exitCode || 0))
     }
