@@ -1,4 +1,4 @@
-name: Test Method 1 (Magnet Chunked Preview)
+name: Test Method 1 (Magnet Multi-Point Preview)
 
 on:
   workflow_dispatch:
@@ -6,11 +6,10 @@ on:
       magnet_link:
         description: 'Direct Magnet URI'
         required: true
-        default: 'magnet:?xt=urn:btih:08ada5a7a6183aae1e09d831df6748d566095a10&dn=Sintel&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce&tr=wss%3A%2F%2Ftracker.openwebtorrent.com&ws=https%3A%2F%2Fwebtorrent.io%2Ftorrents%2F'
-      seek_time:
-        description: 'Timestamp for thumbnail & clip (HH:MM:SS)'
+      sample_points:
+        description: 'Comma-separated percentages to capture 1s each'
         required: false
-        default: '00:00:30'
+        default: '20,40,60,80'
 
 permissions:
   contents: write
@@ -31,14 +30,14 @@ jobs:
           sudo apt-get update && sudo apt-get install -y ffmpeg
           npm install
 
-      - name: Generate preview from magnet
-        run: node method1_stream.mjs "${{ inputs.magnet_link }}" "${{ inputs.seek_time }}"
+      - name: Generate full-res thumbnail & multi-point preview
+        run: node method1_stream.mjs "${{ inputs.magnet_link }}" "${{ inputs.sample_points }}"
 
-      - name: Commit previews to repo folder
+      - name: Replace output folder in repo
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add previews/
-          git diff --staged --quiet || git commit -m "Add generated thumbnail and preview"
+          git add -A output/
+          git diff --staged --quiet || git commit -m "Replace output with latest thumbnail and preview"
           git pull --rebase
           git push
