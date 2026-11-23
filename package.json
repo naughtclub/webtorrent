@@ -3,5 +3,8 @@
   "type": "module",
   "dependencies": {
     "webtorrent": "^2.5.0"
+  },
+  "overrides": {
+    "uint8-util": "2.2.5"
   }
 }
