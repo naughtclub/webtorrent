@@ -5,10 +5,21 @@ import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 
-const magnetUri = process.argv[2]
+const DEFAULT_TRACKERS = [
+  'udp://tracker.opentrackr.org:1337/announce',
+  'udp://open.stealth.si:80/announce',
+  'udp://tracker.torrent.eu.org:451/announce',
+  'udp://exodus.desync.com:6969/announce',
+  'udp://tracker.openbittorrent.com:6969/announce',
+  'http://tracker.opentrackr.org:1337/announce',
+  'wss://tracker.openwebtorrent.com',
+  'wss://tracker.btorrent.xyz',
+]
+
+const rawMagnetUri = process.argv[2]
 const pointsArg = process.argv[3] || '20,40,60,80'
 
-if (!magnetUri || !magnetUri.startsWith('magnet:')) {
+if (!rawMagnetUri || !rawMagnetUri.startsWith('magnet:')) {
   console.error('Usage: node method1_stream.mjs "<magnet_uri>" [percent_list]')
   process.exit(1)
 }
@@ -22,6 +33,17 @@ const samplePercents = pointsArg
 if (samplePercents.length === 0) {
   console.error('Provide valid percentages between 1 and 99 (e.g., 20,40,60,80)')
   process.exit(1)
+}
+
+// Append public trackers without overwriting any trackers already in the magnet link
+function withDefaultTrackers(uri) {
+  const lower = uri.toLowerCase()
+  const extra = DEFAULT_TRACKERS.filter(
+    (tr) => !lower.includes(encodeURIComponent(tr).toLowerCase()) && !lower.includes(tr.toLowerCase())
+  )
+    .map((tr) => `&tr=${encodeURIComponent(tr)}`)
+    .join('')
+  return `${uri}${extra}`
 }
 
 function runCmd(cmd, args) {
@@ -149,6 +171,7 @@ function startChunkedServer(file, chunkSize = 512 * 1024) {
   })
 }
 
+const magnetUri = withDefaultTrackers(rawMagnetUri)
 const startTime = Date.now()
 const client = new WebTorrent()
 
@@ -158,11 +181,15 @@ client.on('error', (err) => {
 })
 
 console.log('Fetching magnet metadata...')
-client.add(
+const torrentHandle = client.add(
   magnetUri,
   { deselect: true, destroyStoreOnDestroy: true },
   async (torrent) => {
-    torrent.deselect(0, torrent.pieces.length - 1, false)
+    clearInterval(metaTicker)
+
+    if (torrent.pieces.length > 0) {
+      torrent.deselect(0, torrent.pieces.length - 1, false)
+    }
     torrent.files.forEach((f) => f.deselect())
 
     const videoExts = ['.mp4', '.mkv', '.webm', '.mov', '.avi']
@@ -205,12 +232,12 @@ client.add(
 
         const args = ['-y', '-ss', ts, '-i', streamUrl]
 
-        // Grab full-resolution thumbnail from the first sample point (20%) with zero extra download
+        // Grab full-resolution thumbnail at the first sample point (20%) with zero extra download
         if (i === 0) {
           args.push('-frames:v', '1', '-q:v', '2', thumbPath)
         }
 
-        // Grab 1-second full-resolution clip (pad ensures even dimensions for libx264 without scaling)
+        // Capture 1-second clip at native resolution (pad guarantees even dimensions for libx264)
         args.push(
           '-t', '1',
           '-an',
@@ -227,7 +254,7 @@ client.add(
         await runCmd('ffmpeg', args)
       }
 
-      // Merge all 1-second clips into a single full-resolution preview
+      // Stitch all 1-second clips into a single full-resolution preview
       const concatListPath = path.join(tmpDir, 'concat.txt')
       const concatContent = clipPaths
         .map((p) => `file '${p.replace(/'/g, "'\\''")}'`)
@@ -254,7 +281,7 @@ client.add(
       console.log(`Resolution:   ${width}x${height} (native)`)
       console.log(`Elapsed time: ${elapsedSec}s`)
       console.log(`Downloaded:   ${downloadedMB} MB / ${totalMB} MB (${pct}%)`)
-      console.log(`Saved files:  output/thumbnail.jpg, output/preview.mp4`)
+      console.log('Saved files:  output/thumbnail.jpg, output/preview.mp4')
     } catch (err) {
       console.error('Failed:', err.message)
       process.exitCode = 1
@@ -265,3 +292,7 @@ client.add(
     }
   }
 )
+
+const metaTicker = setInterval(() => {
+  console.log(`Waiting for metadata... peers: ${torrentHandle.numPeers}`)
+}, 10000)
