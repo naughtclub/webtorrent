@@ -1,0 +1,36 @@
+name: Test Method 1 (WebTorrent Stream)
+
+on:
+  workflow_dispatch:
+    inputs:
+      torrent_source:
+        description: 'Magnet URI or .torrent URL'
+        required: true
+        default: 'https://webtorrent.io/torrents/sintel.torrent'
+
+jobs:
+  test-method-1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+          npm install
+
+      - name: Run Method 1
+        run: node method1_stream.mjs "${{ inputs.torrent_source }}"
+
+      - name: Upload Method 1 outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: method1-preview
+          path: |
+            m1_thumbnail.jpg
+            m1_preview.mp4
